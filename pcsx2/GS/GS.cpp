@@ -542,10 +542,14 @@ void GSToggleVideoCapture()
 
 static bool s_layer_recording = false;
 
-bool GSStartLayerRecording(const std::string& dir)
+bool GSStartLayerRecording(const std::string& requested_dir)
 {
 	if (!g_gs_renderer || s_layer_recording)
 		return false;
+	// Never overwrite an earlier recording: name-2, name-3, ... when the folder already holds one.
+	std::string dir = requested_dir;
+	for (int n = 2; FileSystem::FileExists(Path::Combine(dir, "capture.gs.zst").c_str()); n++)
+		dir = fmt::format("{}-{}", requested_dir, n);
 	if (!FileSystem::CreateDirectoryPath(dir.c_str(), true))
 	{
 		Host::AddKeyedOSDMessage("GGRec", fmt::format("Can't create recording folder {}", dir), Host::OSD_ERROR_DURATION);
