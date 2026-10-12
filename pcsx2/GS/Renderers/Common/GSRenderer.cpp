@@ -801,6 +801,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				fmt::format(TRANSLATE_FS("GS", "Saved GS dump to '{}'."), Path::GetFileName(m_dump->GetPath())),
 				Host::OSD_INFO_DURATION);
 			m_dump.reset();
+			GSOnGSDumpFinished();
 		}
 		else if (!last)
 		{

@@ -11,6 +11,7 @@
 #include "DebugTools/SymbolImporter.h"
 #include "Elfheader.h"
 #include "FW.h"
+#include "GGScript.h"
 #include "GS.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
 #include "GSDumpReplayer.h"
@@ -2969,6 +2970,7 @@ void VMManager::Internal::PollInputOnCPUThread()
 {
 	Host::PumpMessagesOnCPUThread();
 	InputManager::PollSources();
+	GGScript::OnPollInput();
 
 	if (EmuConfig.EnableRecordingTools)
 	{

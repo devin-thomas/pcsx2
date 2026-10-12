@@ -2632,8 +2632,11 @@ void GSState::FlushPrim()
 			}
 		}
 
+		// gg-layers: drop draws outside the selected layers (pcsx2-gsrunner -layers). Needs proper testing.
+		const bool layer_skip = GSLayerFilter::IsActive() && ApplyLayerFilter() == GSLayerFilter::Action::Skip;
+
 		// Skip draw if Z test is enabled, but set to fail all pixels.
-		const bool skip_draw = (m_context->TEST.ZTE && m_context->TEST.ZTST == ZTST_NEVER);
+		const bool skip_draw = (m_context->TEST.ZTE && m_context->TEST.ZTST == ZTST_NEVER) || layer_skip;
 		m_quad_check_valid = false;
 		m_quad_check_valid_shuffle = false;
 		m_drawlist.clear();

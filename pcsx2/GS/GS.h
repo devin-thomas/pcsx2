@@ -82,6 +82,14 @@ bool GSIsSavingMetrics();
 bool GSBeginCapture(std::string filename);
 void GSEndCapture();
 void GSToggleVideoCapture();
+
+// gg-layers: a GS dump plus a reference video (with sound) recorded together into one folder.
+// Called on the GS thread. GG_CAPTURE_ROOT picks the parent folder; GG_MAX_SECONDS caps the length.
+bool GSStartLayerRecording(const std::string& dir);
+void GSStopLayerRecording();
+void GSToggleLayerRecording();
+bool GSIsLayerRecording();
+void GSOnGSDumpFinished();
 void GSPresentCurrentFrame();
 void GSThrottlePresentation();
 void GSGameChanged();

@@ -32,6 +32,7 @@
 #include "pcsx2/CDVD/CDVD.h"
 #include "pcsx2/GS.h"
 #include "pcsx2/GS/Renderers/Common/GSDevice.h"
+#include "pcsx2/GS/GSLayerFilter.h"
 #include "pcsx2/GS/GSPerfMon.h"
 #include "pcsx2/GSDumpReplayer.h"
 #include "pcsx2/GameList.h"
@@ -80,6 +81,12 @@ static s32 s_loop_count = 1;
 static std::optional<bool> s_use_window;
 static bool s_no_console = false;
 static bool s_perf_enable = false;
+
+// gg-layers options (see GSLayerFilter.h).
+static std::string s_layer_rules;
+static std::string s_layer_keep;
+static std::string s_layer_bg;
+static std::string s_layer_census;
 
 // Owned by the GS thread.
 static u32 s_dump_frame_number = 0;
@@ -577,6 +584,26 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				s_settings_interface.SetStringValue("EmuCore/GS", "SWDumpDirectory", argv[++i]);
 				continue;
 			}
+			else if (CHECK_ARG_PARAM("-layers"))
+			{
+				s_layer_rules = argv[++i];
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-keep"))
+			{
+				s_layer_keep = argv[++i];
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-bg"))
+			{
+				s_layer_bg = argv[++i];
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-census"))
+			{
+				s_layer_census = argv[++i];
+				continue;
+			}
 			else if (CHECK_ARG_PARAM("-loop"))
 			{
 				s_loop_count = StringUtil::FromChars<s32>(argv[++i]).value_or(0);
@@ -884,6 +911,16 @@ int main(int argc, char* argv[])
 	if (!GSRunner::ParseCommandLineArgs(argc, argv, params))
 		return EXIT_FAILURE;
 
+	if (!s_layer_rules.empty() || !s_layer_census.empty() || !s_layer_bg.empty())
+	{
+		std::string error;
+		if (!GSLayerFilter::Configure(s_layer_rules, s_layer_keep, s_layer_bg, s_layer_census, &error))
+		{
+			Console.Error("gg-layers: %s", error.c_str());
+			return EXIT_FAILURE;
+		}
+	}
+
 	if (s_use_window.value_or(true) && !GSRunner::CreatePlatformWindow())
 	{
 		Console.Error("Failed to create window.");
@@ -897,6 +934,7 @@ int main(int argc, char* argv[])
 	std::thread cputhread(CPUThreadMain, &params, &thread_ret);
 	GSRunner::PumpPlatformMessages(/*forever=*/true);
 	cputhread.join();
+	GSLayerFilter::Shutdown();
 
 	GSRunner::DestroyPlatformWindow();
 

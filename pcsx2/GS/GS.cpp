@@ -53,6 +53,8 @@
 
 #include "fmt/format.h"
 
+#include <ctime>
+#include <cstdlib>
 #include <fstream>
 
 Pcsx2Config::GSOptions GSConfig;
@@ -536,6 +538,71 @@ void GSToggleVideoCapture()
 
 	std::string filename(fmt::format("{}.{}", GSGetBaseVideoFilename(), GSConfig.CaptureContainer));
 	g_gs_renderer->BeginCapture(std::move(filename));
+}
+
+static bool s_layer_recording = false;
+
+bool GSStartLayerRecording(const std::string& dir)
+{
+	if (!g_gs_renderer || s_layer_recording)
+		return false;
+	if (!FileSystem::CreateDirectoryPath(dir.c_str(), true))
+	{
+		Host::AddKeyedOSDMessage("GGRec", fmt::format("Can't create recording folder {}", dir), Host::OSD_ERROR_DURATION);
+		return false;
+	}
+
+	const char* max_env = std::getenv("GG_MAX_SECONDS");
+	const u32 max_seconds = max_env ? StringUtil::FromChars<u32>(max_env).value_or(120) : 120;
+	// The dump stops itself after this many frames; GSOnGSDumpFinished() then ends the video too.
+	GSQueueSnapshot(Path::Combine(dir, "capture.png"), max_seconds * 60);
+	if (GSCapture::IsCapturing())
+		g_gs_renderer->EndCapture();
+	g_gs_renderer->BeginCapture(Path::Combine(dir, "reference.mp4"));
+
+	s_layer_recording = true;
+	Host::AddKeyedOSDMessage("GGRec", fmt::format("● REC  {}", Path::GetFileName(dir)), 24.0f * 3600.0f);
+	return true;
+}
+
+void GSStopLayerRecording()
+{
+	if (!s_layer_recording)
+		return;
+	s_layer_recording = false;
+	GSStopGSDump();
+	if (GSCapture::IsCapturing())
+		g_gs_renderer->EndCapture();
+	Host::RemoveKeyedOSDMessage("GGRec");
+}
+
+void GSToggleLayerRecording()
+{
+	if (s_layer_recording)
+	{
+		GSStopLayerRecording();
+		return;
+	}
+	const char* root_env = std::getenv("GG_CAPTURE_ROOT");
+	const std::string root = root_env ? std::string(root_env) : Path::Combine(EmuFolders::Snapshots, "gg-captures");
+	std::time_t now = std::time(nullptr);
+	char stamp[32];
+	std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now));
+	GSStartLayerRecording(Path::Combine(root, stamp));
+}
+
+bool GSIsLayerRecording()
+{
+	return s_layer_recording;
+}
+
+void GSOnGSDumpFinished()
+{
+	if (s_layer_recording)
+	{
+		Host::AddKeyedOSDMessage("GGRecLimit", "Recording stopped (length limit or dump finished).", Host::OSD_INFO_DURATION);
+		GSStopLayerRecording();
+	}
 }
 
 void GSPresentCurrentFrame()
@@ -1236,6 +1303,15 @@ BEGIN_HOTKEY_LIST(g_gs_hotkeys){"Screenshot", TRANSLATE_NOOP("Hotkeys", "Graphic
 				MTGS::RunOnGSThread(&GSToggleVideoCapture);
 
 				// Sync GS thread. We want to start adding audio at the same time as video.
+				MTGS::WaitGS(false, false, false);
+			}
+		}},
+	{"GGToggleLayerRecording", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+		TRANSLATE_NOOP("Hotkeys", "Toggle Layer Recording (GS dump + video)"),
+		[](s32 pressed) {
+			if (!pressed)
+			{
+				MTGS::RunOnGSThread(&GSToggleLayerRecording);
 				MTGS::WaitGS(false, false, false);
 			}
 		}},

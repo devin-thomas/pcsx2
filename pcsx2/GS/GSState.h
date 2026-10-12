@@ -5,6 +5,7 @@
 
 #include "GS/GS.h"
 #include "GS/GSPerfMon.h"
+#include "GS/GSLayerFilter.h"
 #include "GS/GSLocalMemory.h"
 #include "GS/GSDrawingContext.h"
 #include "GS/GSDrawingEnvironment.h"
@@ -528,6 +529,8 @@ public:
 	void SetRegsMem(u8* basemem) { m_regs = reinterpret_cast<GSPrivRegSet*>(basemem); }
 
 	void DumpDrawInfo(bool dump_regs, bool dump_verts, bool dump_transfers);
+	// gg-layers: label the pending draw and keep, drop or recolour it (GSLayerFilter.cpp).
+	GSLayerFilter::Action ApplyLayerFilter();
 	void DumpVertices(const std::string& filename);
 	void DumpTransferList(const std::string& filename);
 	void DumpTransferImages();

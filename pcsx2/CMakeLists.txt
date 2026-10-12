@@ -136,6 +136,7 @@ set(pcsx2Sources
 	Vif_Transfer.cpp
 	Vif_Unpack.cpp
 	VMManager.cpp
+	GGScript.cpp
 	vtlb.cpp
 	VU0.cpp
 	VUmicro.cpp
@@ -499,6 +500,7 @@ set(pcsx2GSSources
 	GS/GSDrawingContext.cpp
 	GS/GSDrawingEnvironment.cpp
 	GS/GSDump.cpp
+	GS/GSLayerFilter.cpp
 	GS/GSLocalMemory.cpp
 	GS/GSLzma.cpp
 	GS/GSPerfMon.cpp
@@ -533,6 +535,7 @@ set(pcsx2GSHeaders
 	GS/GSDrawingContext.h
 	GS/GSDrawingEnvironment.h
 	GS/GSDump.h
+	GS/GSLayerFilter.h
 	GS/GSExtra.h
 	GS/GSGL.h
 	GS/GSRegs.h
@@ -1149,6 +1152,7 @@ target_link_libraries(PCSX2_FLAGS INTERFACE
 	common
 	imgui
 	fmt::fmt
+	rapidjson
 	libchdr
 	libzip::zip
 	cpuinfo
