@@ -377,70 +377,128 @@ GSLayerFilter::Action GSState::ApplyLayerFilter()
 
 	GSVertexBuff& vtx_buff = *m_vertex;
 	GSIndexBuff& idx_buff = *m_index;
-	float x0 = FLT_MAX, y0 = FLT_MAX, x1 = -FLT_MAX, y1 = -FLT_MAX;
-	float u0 = FLT_MAX, t0 = FLT_MAX, u1 = -FLT_MAX, t1 = -FLT_MAX;
 	const float tw = static_cast<float>(1 << ctx.TEX0.TW);
 	const float th = static_cast<float>(1 << ctx.TEX0.TH);
-	for (u32 i = 0; i < idx_buff.tail; i++)
-	{
-		const GSVertex& vx = vtx_buff.buff[idx_buff.buff[i]];
-		const float x = (static_cast<int>(vx.XYZ.X) - static_cast<int>(ctx.XYOFFSET.OFX)) / 16.0f;
-		const float y = (static_cast<int>(vx.XYZ.Y) - static_cast<int>(ctx.XYOFFSET.OFY)) / 16.0f;
-		x0 = std::min(x0, x);
-		y0 = std::min(y0, y);
-		x1 = std::max(x1, x);
-		y1 = std::max(y1, y);
-		float u, t;
-		if (PRIM->FST)
-		{
-			u = vx.U / 16.0f;
-			t = vx.V / 16.0f;
-		}
-		else
-		{
-			const float q = (vx.RGBAQ.Q != 0.0f) ? vx.RGBAQ.Q : 1.0f;
-			u = vx.ST.S / q * tw;
-			t = vx.ST.T / q * th;
-		}
-		u0 = std::min(u0, u);
-		t0 = std::min(t0, t);
-		u1 = std::max(u1, u);
-		t1 = std::max(t1, t);
-	}
-	if (idx_buff.tail > 0)
-	{
-		v[F::X0] = static_cast<s64>(std::floor(x0));
-		v[F::Y0] = static_cast<s64>(std::floor(y0));
-		v[F::X1] = static_cast<s64>(std::ceil(x1));
-		v[F::Y1] = static_cast<s64>(std::ceil(y1));
-		v[F::W] = v[F::X1] - v[F::X0];
-		v[F::H] = v[F::Y1] - v[F::Y0];
-		v[F::U0] = static_cast<s64>(std::floor(u0));
-		v[F::V0] = static_cast<s64>(std::floor(t0));
-		v[F::U1] = static_cast<s64>(std::ceil(u1));
-		v[F::V1] = static_cast<s64>(std::ceil(t1));
-		const GSVertex& first = vtx_buff.buff[idx_buff.buff[0]];
-		v[F::R] = first.RGBAQ.R;
-		v[F::G] = first.RGBAQ.G;
-		v[F::B] = first.RGBAQ.B;
-		v[F::A] = first.RGBAQ.A;
-	}
-	v[F::NV] = idx_buff.tail;
 
-	const GSLayerFilter::Action action = GSLayerFilter::Decide(f);
-	if (action == GSLayerFilter::Action::Recolor)
-	{
-		// Paint this draw with the solid background colour; the vertex trace must see the new colours.
-		const u32 bg = GSLayerFilter::GetBackgroundRGBA();
-		for (u32 i = 0; i < idx_buff.tail; i++)
+	// Geometry and colour fields for the primitives [first, last) (counted in indices).
+	auto measure = [&](u32 first, u32 last, F& out) {
+		float x0 = FLT_MAX, y0 = FLT_MAX, x1 = -FLT_MAX, y1 = -FLT_MAX;
+		float u0 = FLT_MAX, t0 = FLT_MAX, u1 = -FLT_MAX, t1 = -FLT_MAX;
+		for (u32 i = first; i < last; i++)
 		{
-			GSVertex& vx = vtx_buff.buff[idx_buff.buff[i]];
-			vx.RGBAQ.R = (bg >> 16) & 0xFF;
-			vx.RGBAQ.G = (bg >> 8) & 0xFF;
-			vx.RGBAQ.B = bg & 0xFF;
-			vx.RGBAQ.A = 0x80;
+			const GSVertex& vx = vtx_buff.buff[idx_buff.buff[i]];
+			const float x = (static_cast<int>(vx.XYZ.X) - static_cast<int>(ctx.XYOFFSET.OFX)) / 16.0f;
+			const float y = (static_cast<int>(vx.XYZ.Y) - static_cast<int>(ctx.XYOFFSET.OFY)) / 16.0f;
+			x0 = std::min(x0, x);
+			y0 = std::min(y0, y);
+			x1 = std::max(x1, x);
+			y1 = std::max(y1, y);
+			float u, t;
+			if (PRIM->FST)
+			{
+				u = vx.U / 16.0f;
+				t = vx.V / 16.0f;
+			}
+			else
+			{
+				const float q = (vx.RGBAQ.Q != 0.0f) ? vx.RGBAQ.Q : 1.0f;
+				u = vx.ST.S / q * tw;
+				t = vx.ST.T / q * th;
+			}
+			u0 = std::min(u0, u);
+			t0 = std::min(t0, t);
+			u1 = std::max(u1, u);
+			t1 = std::max(t1, t);
 		}
-		m_vt.Update(vtx_buff.buff, idx_buff.buff, vtx_buff.tail, idx_buff.tail, GSUtil::GetPrimClass(PRIM->PRIM));
+		s64* o = out.v;
+		if (last > first)
+		{
+			o[F::X0] = static_cast<s64>(std::floor(x0));
+			o[F::Y0] = static_cast<s64>(std::floor(y0));
+			o[F::X1] = static_cast<s64>(std::ceil(x1));
+			o[F::Y1] = static_cast<s64>(std::ceil(y1));
+			o[F::W] = o[F::X1] - o[F::X0];
+			o[F::H] = o[F::Y1] - o[F::Y0];
+			o[F::U0] = static_cast<s64>(std::floor(u0));
+			o[F::V0] = static_cast<s64>(std::floor(t0));
+			o[F::U1] = static_cast<s64>(std::ceil(u1));
+			o[F::V1] = static_cast<s64>(std::ceil(t1));
+			const GSVertex& v0 = vtx_buff.buff[idx_buff.buff[first]];
+			o[F::R] = v0.RGBAQ.R;
+			o[F::G] = v0.RGBAQ.G;
+			o[F::B] = v0.RGBAQ.B;
+			o[F::A] = v0.RGBAQ.A;
+		}
+		o[F::NV] = last - first;
+	};
+
+	// PCSX2 batches consecutive primitives until the GS state changes, so one "draw" can hold more than one layer
+	// (AC+ draws a character's floor shadow and body with the same texture, only the vertex alpha differs). Split the
+	// batch into runs of primitives with the same vertex alpha and label each run on its own.
+	const u32 per_prim = std::max(1, GSUtil::GetClassVertexCount(GSUtil::GetPrimClass(PRIM->PRIM)));
+	const u32 nidx = idx_buff.tail - (idx_buff.tail % per_prim);
+	struct Run
+	{
+		u32 first, last;
+		GSLayerFilter::Action action;
+	};
+	std::vector<Run> runs;
+	for (u32 i = 0; i < nidx; i += per_prim)
+	{
+		const u8 a = vtx_buff.buff[idx_buff.buff[i]].RGBAQ.A;
+		if (!runs.empty() && vtx_buff.buff[idx_buff.buff[runs.back().first]].RGBAQ.A == a)
+			runs.back().last = i + per_prim;
+		else
+			runs.push_back({i, i + per_prim, GSLayerFilter::Action::Draw});
 	}
-	return action;
+	if (runs.empty())
+		runs.push_back({0, idx_buff.tail, GSLayerFilter::Action::Draw});
+
+	bool any_kept = false, all_kept = true, any_recolor = false;
+	for (Run& r : runs)
+	{
+		F sub = f;
+		measure(r.first, r.last, sub);
+		r.action = GSLayerFilter::Decide(sub);
+		any_kept |= (r.action != GSLayerFilter::Action::Skip);
+		all_kept &= (r.action != GSLayerFilter::Action::Skip);
+		any_recolor |= (r.action == GSLayerFilter::Action::Recolor);
+	}
+	if (!any_kept)
+		return GSLayerFilter::Action::Skip;
+
+	if (any_recolor)
+	{
+		// Paint those primitives with the solid background colour.
+		const u32 bg = GSLayerFilter::GetBackgroundRGBA();
+		for (const Run& r : runs)
+		{
+			if (r.action != GSLayerFilter::Action::Recolor)
+				continue;
+			for (u32 i = r.first; i < r.last; i++)
+			{
+				GSVertex& vx = vtx_buff.buff[idx_buff.buff[i]];
+				vx.RGBAQ.R = (bg >> 16) & 0xFF;
+				vx.RGBAQ.G = (bg >> 8) & 0xFF;
+				vx.RGBAQ.B = bg & 0xFF;
+				vx.RGBAQ.A = 0x80;
+			}
+		}
+	}
+	if (!all_kept)
+	{
+		// Keep only the primitives of selected layers, in their original order.
+		u32 out = 0;
+		for (const Run& r : runs)
+		{
+			if (r.action == GSLayerFilter::Action::Skip)
+				continue;
+			for (u32 i = r.first; i < r.last; i++)
+				idx_buff.buff[out++] = idx_buff.buff[i];
+		}
+		idx_buff.tail = out;
+	}
+	if (any_recolor || !all_kept)
+		m_vt.Update(vtx_buff.buff, idx_buff.buff, vtx_buff.tail, idx_buff.tail, GSUtil::GetPrimClass(PRIM->PRIM));
+	return GSLayerFilter::Action::Draw;
 }
