@@ -12,6 +12,7 @@
 #include "GS/GSLzma.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
+#include "GGScript.h"
 #include "GS/MultiISA.h"
 #include "GS/GSPerfMon.h"
 #include "Host.h"
@@ -565,6 +566,7 @@ bool GSStartLayerRecording(const std::string& requested_dir)
 	g_gs_renderer->BeginCapture(Path::Combine(dir, "reference.mp4"));
 
 	s_layer_recording = true;
+	GGScript::OnLayerRecordingStarted(dir);
 	Host::AddKeyedOSDMessage("GGRec", fmt::format("● REC  {}", Path::GetFileName(dir)), 24.0f * 3600.0f);
 	return true;
 }

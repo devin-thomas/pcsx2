@@ -15,7 +15,11 @@
 #include "common/Path.h"
 #include "common/StringUtil.h"
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -32,6 +36,16 @@
 //   turbo on|off             run unthrottled (menus) or at normal speed
 //   log <text>
 //   quit                     shut the VM down (pcsx2-qt -batch then exits)
+//
+// Input log (GG_INPUT_LOG=<file>): while no script is playing (none given, or after the given one has run out
+// without quitting), port 1's pad state is written to <file> every frame, run-length encoded, in the format above:
+// numpad directions with "face right" (6 = Right), P K S H D for Square Cross Triangle Circle R1, PS2 names joined
+// with '+' when other buttons are held. These are the button bits the game reads; the left stick is folded into
+// the directions past half-way (the replay then has no analog stick, so a take played on the stick may not replay
+// exactly; the log says so at the end). "rec start <name>" / "rec stop" go in at the frame the touchpad or F10
+// toggled the layer recording, and "quit" at the frame the VM shut down. Fed back as GG_SCRIPT from the same start
+// (the same save state, or the same script followed by the log), it plays the take again frame for frame.
+// An existing file is never overwritten: <file> becomes <stem>-2<ext>, -3, ...
 namespace GGScript
 {
 	enum class Kind
@@ -60,7 +74,23 @@ namespace GGScript
 	static std::vector<Step> s_steps;
 	static size_t s_pos = 0;
 	static u32 s_left = 0;
+	static u32 s_mask = 0;
+	static bool s_quit = false;
 	static u64 s_frame = 0;
+	static std::string s_script_path;
+
+	// Input log
+	static const char* s_log_path = nullptr;
+	static std::FILE* s_log = nullptr;
+	static u64 s_log_frame = 0; // frames logged
+	static u64 s_log_first = 0; // run frame of the first logged frame
+	static u32 s_run_mask = 0;
+	static u32 s_run_len = 0;
+	static u64 s_run_start = 0;
+	static bool s_log_rec = false; // layer recording on at the previous logged frame
+	static u64 s_stick_frames = 0; // frames where the left stick added a direction the d-pad didn't have
+	static std::mutex s_rec_mutex;
+	static std::string s_rec_name;
 
 	static constexpr u32 Bit(PadDualshock2::Inputs i)
 	{
@@ -206,10 +236,263 @@ namespace GGScript
 		return true;
 	}
 
+	// Applied every frame, so a controller touched during a script can't leave a button held. Sticks stay centred.
 	static void ApplyButtons(u32 mask)
 	{
 		for (u32 i = 0; i <= PadDualshock2::PAD_R3; i++)
 			Pad::SetControllerState(0, i, (mask & (1u << i)) ? 1.0f : 0.0f);
+		for (u32 i = PadDualshock2::PAD_L_UP; i <= PadDualshock2::PAD_R_LEFT; i++)
+			Pad::SetControllerState(0, i, 0.0f);
+	}
+
+	// ------------------------------------------------------------------ input log
+
+	// PadDualshock2::bitmaskMapping (private there): the bit of PadDualshock2::GetButtons() for each input, active low.
+	static constexpr u8 s_button_bit[PadDualshock2::PAD_R3 + 1] = {12, 13, 14, 15, 4, 5, 6, 7, 8, 11, 2, 0, 3, 1, 9, 10};
+	static constexpr u8 s_stick_fold = 128; // left stick past half-way counts as that direction
+
+	// One frame's input in script notation: "5", "2D", "9", "6PK", or "Right+Start" when other buttons are held.
+	static std::string Describe(u32 mask)
+	{
+		using I = PadDualshock2::Inputs;
+		const u32 up = Bit(I::PAD_UP), right = Bit(I::PAD_RIGHT), down = Bit(I::PAD_DOWN), left = Bit(I::PAD_LEFT);
+		static constexpr std::pair<char, I> letters[] = {
+			{'P', I::PAD_SQUARE}, {'K', I::PAD_CROSS}, {'S', I::PAD_TRIANGLE}, {'H', I::PAD_CIRCLE}, {'D', I::PAD_R1}};
+		u32 letter_mask = 0;
+		for (const auto& [c, i] : letters)
+			letter_mask |= Bit(i);
+		const u32 dirs = mask & (up | right | down | left);
+		const bool opposed = (dirs & (up | down)) == (up | down) || (dirs & (left | right)) == (left | right);
+		std::string out;
+		if (!opposed && (mask & ~(dirs | letter_mask)) == 0)
+		{
+			const int x = (dirs & right) ? 1 : (dirs & left) ? -1 : 0;
+			const int y = (dirs & up) ? 1 : (dirs & down) ? -1 : 0;
+			const char digit = static_cast<char>('1' + (y + 1) * 3 + (x + 1));
+			if (digit != '5' || (mask & letter_mask) == 0)
+				out += digit;
+			for (const auto& [c, i] : letters)
+			{
+				if (mask & Bit(i))
+					out += c;
+			}
+			return out;
+		}
+		static constexpr std::pair<std::string_view, I> names[] = {
+			{"Up", I::PAD_UP}, {"Right", I::PAD_RIGHT}, {"Down", I::PAD_DOWN}, {"Left", I::PAD_LEFT},
+			{"Triangle", I::PAD_TRIANGLE}, {"Circle", I::PAD_CIRCLE}, {"Cross", I::PAD_CROSS}, {"Square", I::PAD_SQUARE},
+			{"Select", I::PAD_SELECT}, {"Start", I::PAD_START}, {"L1", I::PAD_L1}, {"L2", I::PAD_L2},
+			{"R1", I::PAD_R1}, {"R2", I::PAD_R2}, {"L3", I::PAD_L3}, {"R3", I::PAD_R3},
+		};
+		for (const auto& [n, i] : names)
+		{
+			if (mask & Bit(i))
+			{
+				if (!out.empty())
+					out += '+';
+				out += n;
+			}
+		}
+		return out;
+	}
+
+	static void LogLine(const std::string& step, u64 frame)
+	{
+		std::fprintf(s_log, "%-16s # f%llu\n", step.c_str(), static_cast<unsigned long long>(frame));
+		std::fflush(s_log);
+	}
+
+	static void FlushRun()
+	{
+		if (s_run_len == 0)
+			return;
+		LogLine(s_run_mask == 0 ? fmt::format("wait {}", s_run_len) : fmt::format("{} {}", s_run_len, Describe(s_run_mask)),
+			s_run_start);
+		s_run_len = 0;
+	}
+
+	static bool OpenLog()
+	{
+		const std::string_view full(s_log_path);
+		const std::string_view ext = Path::GetExtension(full);
+		const std::string_view stem = ext.empty() ? full : full.substr(0, full.size() - ext.size() - 1);
+		std::string path(full);
+		for (int n = 2; FileSystem::FileExists(path.c_str()); n++)
+			path = ext.empty() ? fmt::format("{}-{}", stem, n) : fmt::format("{}-{}.{}", stem, n, ext);
+		const std::string dir(Path::GetDirectory(path));
+		if (!dir.empty())
+			FileSystem::CreateDirectoryPath(dir.c_str(), true);
+		s_log = FileSystem::OpenCFile(path.c_str(), "wb");
+		if (!s_log)
+		{
+			Console.Error("gg-log: can't write '%s'", path.c_str());
+			Host::AddKeyedOSDMessage("GGLog", fmt::format("Can't write input log {}", path), Host::OSD_ERROR_DURATION);
+			return false;
+		}
+
+		std::time_t now = std::time(nullptr);
+		char stamp[32];
+		std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+		std::fprintf(s_log, "# gg-layers input log, port 1, %s. Feed it back as GG_SCRIPT from the same start.\n", stamp);
+		std::fprintf(s_log, "# Numpad directions with Sol facing right (6 = Right); P K S H D = Square Cross Triangle Circle R1.\n");
+		std::fprintf(s_log, "# '# fN' is the logged frame each step starts on (f1 = the first logged frame).\n");
+		if (!s_script_path.empty())
+			std::fprintf(s_log, "# Logging started when script %s ran out, on frame %llu of the run.\n", s_script_path.c_str(),
+				static_cast<unsigned long long>(s_frame));
+		std::fprintf(s_log, "map D=R1\nface right\n");
+		std::fflush(s_log);
+		s_log_first = s_frame;
+		s_log_rec = GSIsLayerRecording();
+		Console.WriteLn("gg-log: logging port 1 to '%s' from frame %llu", path.c_str(), static_cast<unsigned long long>(s_frame));
+		Host::AddKeyedOSDMessage("GGLog", fmt::format("Logging inputs to {}", Path::GetFileName(path)), Host::OSD_INFO_DURATION);
+		return true;
+	}
+
+	static void LogFrame()
+	{
+		if (!s_log && (s_log_frame > 0 || !OpenLog()))
+		{
+			s_log_path = nullptr;
+			return;
+		}
+
+		u32 mask = 0;
+		PadBase* pad = Pad::GetPad(0, 0);
+		if (pad && pad->GetType() == Pad::ControllerType::DualShock2)
+		{
+			const u32 buttons = pad->GetButtons();
+			for (u32 i = 0; i <= PadDualshock2::PAD_R3; i++)
+			{
+				if (!(buttons & (1u << s_button_bit[i])))
+					mask |= 1u << i;
+			}
+			u32 stick = 0;
+			if (pad->GetRawInput(PadDualshock2::PAD_L_UP) >= s_stick_fold)
+				stick |= Bit(PadDualshock2::PAD_UP);
+			if (pad->GetRawInput(PadDualshock2::PAD_L_DOWN) >= s_stick_fold)
+				stick |= Bit(PadDualshock2::PAD_DOWN);
+			if (pad->GetRawInput(PadDualshock2::PAD_L_LEFT) >= s_stick_fold)
+				stick |= Bit(PadDualshock2::PAD_LEFT);
+			if (pad->GetRawInput(PadDualshock2::PAD_L_RIGHT) >= s_stick_fold)
+				stick |= Bit(PadDualshock2::PAD_RIGHT);
+			if (stick & ~mask)
+				s_stick_frames++;
+			mask |= stick;
+		}
+
+		s_log_frame++;
+		const bool rec = GSIsLayerRecording();
+		if (rec != s_log_rec)
+		{
+			FlushRun();
+			std::string name;
+			{
+				std::unique_lock lock(s_rec_mutex);
+				name = s_rec_name;
+			}
+			LogLine(rec ? fmt::format("rec start {}", name) : std::string("rec stop"), s_log_frame);
+			Console.WriteLn("gg-log: frame %llu rec %s", static_cast<unsigned long long>(s_log_frame), rec ? "start" : "stop");
+			s_log_rec = rec;
+		}
+		if (s_run_len > 0 && mask == s_run_mask)
+		{
+			s_run_len++;
+			return;
+		}
+		FlushRun();
+		s_run_mask = mask;
+		s_run_len = 1;
+		s_run_start = s_log_frame;
+	}
+
+	static void CloseLog(const char* last_step)
+	{
+		if (!s_log)
+			return;
+		FlushRun();
+		if (last_step)
+			LogLine(last_step, s_log_frame + 1);
+		std::fprintf(s_log, "# %llu frames logged (run frames %llu-%llu).\n", static_cast<unsigned long long>(s_log_frame),
+			static_cast<unsigned long long>(s_log_first), static_cast<unsigned long long>(s_log_first + s_log_frame - 1));
+		if (s_stick_frames > 0)
+			std::fprintf(s_log, "# WARNING: the left stick added a direction on %llu frames. The game read the stick itself, so the replay may differ.\n",
+				static_cast<unsigned long long>(s_stick_frames));
+		std::fclose(s_log);
+		s_log = nullptr;
+		Console.WriteLn("gg-log: closed after %llu frames", static_cast<unsigned long long>(s_log_frame));
+	}
+
+	static void PlayFrame()
+	{
+		while (s_left == 0)
+		{
+			if (s_pos >= s_steps.size())
+			{
+				s_mask = 0;
+				ApplyButtons(0);
+				s_done = true;
+				Console.WriteLn("gg-script: finished at frame %llu", s_frame);
+				return;
+			}
+
+			const Step& step = s_steps[s_pos++];
+			switch (step.kind)
+			{
+				case Kind::Hold:
+					s_left = step.frames;
+					s_mask = step.buttons;
+					break;
+
+				case Kind::RecStart:
+				{
+					const std::string name = step.arg.empty() ? fmt::format("script-{}", s_frame) : step.arg;
+					const std::string dir = Path::Combine(CaptureRoot(), name);
+					MTGS::RunOnGSThread([dir]() { GSStartLayerRecording(dir); });
+					MTGS::WaitGS(false, false, false);
+					Console.WriteLn("gg-script: frame %llu rec start %s", s_frame, dir.c_str());
+					break;
+				}
+
+				case Kind::RecStop:
+					MTGS::RunOnGSThread([]() { GSStopLayerRecording(); });
+					MTGS::WaitGS(false, false, false);
+					Console.WriteLn("gg-script: frame %llu rec stop", s_frame);
+					break;
+
+				case Kind::Shot:
+				{
+					const std::string dir = Path::Combine(CaptureRoot(), "shots");
+					FileSystem::CreateDirectoryPath(dir.c_str(), false);
+					const std::string png = Path::Combine(dir, step.arg + ".png");
+					MTGS::RunOnGSThread([png]() { GSQueueSnapshot(png); });
+					break;
+				}
+
+				case Kind::Save:
+					VMManager::SaveState(step.arg.c_str(), false, false, [](const std::string& error) {
+						Console.Error("gg-script: save state failed: %s", error.c_str());
+					});
+					break;
+
+				case Kind::Turbo:
+					VMManager::SetLimiterMode(step.arg == "on" ? LimiterModeType::Unlimited : LimiterModeType::Nominal);
+					break;
+
+				case Kind::Log:
+					Console.WriteLn("gg-script: frame %llu: %s", s_frame, step.arg.c_str());
+					break;
+
+				case Kind::Quit:
+					ApplyButtons(0);
+					s_done = true;
+					s_quit = true;
+					Console.WriteLn("gg-script: quit at frame %llu", s_frame);
+					Host::RequestVMShutdown(false, false, false);
+					return;
+			}
+		}
+		ApplyButtons(s_mask);
+		s_left--;
 	}
 } // namespace GGScript
 
@@ -220,75 +503,36 @@ void GGScript::OnPollInput()
 		s_loaded = true;
 		const char* path = std::getenv("GG_SCRIPT");
 		s_done = !path || !Load(path);
+		if (path)
+			s_script_path = path;
+		const char* log = std::getenv("GG_INPUT_LOG");
+		s_log_path = (log && *log) ? log : nullptr;
 	}
-	if (s_done)
-		return;
 
 	s_frame++;
-	while (s_left == 0)
-	{
-		if (s_pos >= s_steps.size())
-		{
-			ApplyButtons(0);
-			s_done = true;
-			Console.WriteLn("gg-script: finished at frame %llu", s_frame);
-			return;
-		}
+	if (!s_done)
+		PlayFrame();
+	if (s_done && !s_quit && s_log_path)
+		LogFrame();
+}
 
-		const Step& step = s_steps[s_pos++];
-		switch (step.kind)
-		{
-			case Kind::Hold:
-				s_left = step.frames;
-				ApplyButtons(step.buttons);
-				break;
+void GGScript::OnLayerRecordingStarted(const std::string& dir)
+{
+	std::unique_lock lock(s_rec_mutex);
+	s_rec_name = Path::GetFileName(dir);
+}
 
-			case Kind::RecStart:
-			{
-				const std::string name = step.arg.empty() ? fmt::format("script-{}", s_frame) : step.arg;
-				const std::string dir = Path::Combine(CaptureRoot(), name);
-				MTGS::RunOnGSThread([dir]() { GSStartLayerRecording(dir); });
-				MTGS::WaitGS(false, false, false);
-				Console.WriteLn("gg-script: frame %llu rec start %s", s_frame, dir.c_str());
-				break;
-			}
+void GGScript::OnStateLoaded()
+{
+	if (!s_log)
+		return;
+	FlushRun();
+	std::fprintf(s_log, "# WARNING: a save state was loaded after frame %llu; the steps after this don't follow from the ones before.\n",
+		static_cast<unsigned long long>(s_log_frame));
+	std::fflush(s_log);
+}
 
-			case Kind::RecStop:
-				MTGS::RunOnGSThread([]() { GSStopLayerRecording(); });
-				MTGS::WaitGS(false, false, false);
-				Console.WriteLn("gg-script: frame %llu rec stop", s_frame);
-				break;
-
-			case Kind::Shot:
-			{
-				const std::string dir = Path::Combine(CaptureRoot(), "shots");
-				FileSystem::CreateDirectoryPath(dir.c_str(), false);
-				const std::string png = Path::Combine(dir, step.arg + ".png");
-				MTGS::RunOnGSThread([png]() { GSQueueSnapshot(png); });
-				break;
-			}
-
-			case Kind::Save:
-				VMManager::SaveState(step.arg.c_str(), false, false, [](const std::string& error) {
-					Console.Error("gg-script: save state failed: %s", error.c_str());
-				});
-				break;
-
-			case Kind::Turbo:
-				VMManager::SetLimiterMode(step.arg == "on" ? LimiterModeType::Unlimited : LimiterModeType::Nominal);
-				break;
-
-			case Kind::Log:
-				Console.WriteLn("gg-script: frame %llu: %s", s_frame, step.arg.c_str());
-				break;
-
-			case Kind::Quit:
-				ApplyButtons(0);
-				s_done = true;
-				Console.WriteLn("gg-script: quit at frame %llu", s_frame);
-				Host::RequestVMShutdown(false, false, false);
-				return;
-		}
-	}
-	s_left--;
+void GGScript::OnShutdown()
+{
+	CloseLog("quit");
 }
