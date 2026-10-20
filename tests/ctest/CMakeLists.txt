@@ -25,3 +25,6 @@ endmacro()
 
 add_subdirectory(common)
 add_subdirectory(core)
+
+add_pcsx2_test(control_bridge_test control_bridge_tests.cpp)
+target_include_directories(control_bridge_test PRIVATE ${CMAKE_SOURCE_DIR}/pcsx2)

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "ControlBridge.h"
+
 #include <time.h>
 #include <cmath>
 
@@ -543,6 +545,7 @@ static __fi void VSyncStart(u64 sCycle)
 
 	// Bail out before the next frame starts if we're paused, or the CPU has changed.
 	// Need to re-check this, because we might've paused during the sleep time.
+	ControlBridge::BoundaryCompleted();
 	if (VMManager::Internal::IsExecutionInterrupted())
 		Cpu->ExitExecution();
 }

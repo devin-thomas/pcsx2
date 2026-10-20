@@ -124,4 +124,5 @@ oprofile_data/
 CMakeSettings.json
 /ci-artifacts/
 /out/
+/.bridge-build/
 /.cache/

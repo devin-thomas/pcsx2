@@ -7,6 +7,7 @@
 #include "Elfheader.h"
 #include "SaveState.h"
 #include "PINE.h"
+#include "ControlBridge.h"
 #include "VMManager.h"
 #include "vtlb.h"
 #include "common/Error.h"
@@ -92,6 +93,7 @@ namespace PINEServer
 {
 	static std::thread s_thread;
 	static int s_slot;
+	static uint64_t s_connection = 0;
 
 #ifdef _WIN32
 	// windows claim to have support for AF_UNIX sockets but that is a blatant lie,
@@ -422,6 +424,7 @@ void PINEServer::MainLoop()
 			continue;
 
 		ClientLoop();
+		ControlBridge::Disconnect(s_connection);
 
 		Console.WriteLn("PINE: Client disconnected.");
 		safe_close_portable(s_msgsock);
@@ -430,6 +433,22 @@ void PINEServer::MainLoop()
 
 void PINEServer::ClientLoop()
 {
+	++s_connection;
+	if (ControlBridge::Enabled())
+	{
+		// Bound partial-frame/idle disconnect cleanup for the diagnostic protocol.
+#ifdef _WIN32
+		const DWORD timeout = 5000;
+#else
+		const timeval timeout{5, 0};
+#endif
+		if (setsockopt(s_msgsock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0 ||
+			setsockopt(s_msgsock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0)
+		{
+			Console.Error("PINE: Cannot enforce diagnostic socket timeout.");
+			return;
+		}
+	}
 	while (!s_end.load(std::memory_order_acquire))
 	{
 		// either int or ssize_t depending on the platform, so we have to
@@ -442,7 +461,8 @@ void PINEServer::ClientLoop()
 		// socket datagram splittage, we continue to read
 		while (receive_length < end_length)
 		{
-			const auto tmp_length = read_portable(s_msgsock, &ipc_buffer_span[receive_length], MAX_IPC_SIZE - receive_length);
+			const auto tmp_length = read_portable(s_msgsock, &ipc_buffer_span[receive_length],
+				ControlBridge::Enabled() ? end_length - receive_length : MAX_IPC_SIZE - receive_length);
 
 			// we recreate the socket if an error happens
 			if (tmp_length <= 0)
@@ -454,6 +474,8 @@ void PINEServer::ClientLoop()
 			if (end_length == 4 && receive_length >= 4)
 			{
 				end_length = FromSpan<u32>(ipc_buffer_span, 0);
+				if (ControlBridge::Enabled() && (end_length < 5 || end_length > 293))
+					return;
 				// we'd like to avoid a client trying to do OOB
 				if (end_length > MAX_IPC_SIZE || end_length < 4)
 				{
@@ -474,7 +496,18 @@ void PINEServer::ClientLoop()
 			res = ParseCommand(ipc_buffer_span.subspan(4), s_ret_buffer, (u32)end_length - 4);
 
 			// if we cannot send back our answer restart the socket
-			if (write_portable(s_msgsock, res.buffer.data(), res.size) < 0)
+			if (ControlBridge::Enabled())
+			{
+				int sent = 0;
+				while (sent < res.size)
+				{
+					const auto written = write_portable(s_msgsock, res.buffer.data() + sent, res.size - sent);
+					if (written <= 0)
+						return;
+					sent += written;
+				}
+			}
+			else if (write_portable(s_msgsock, res.buffer.data(), res.size) < 0)
 				return;
 		}
 	}
@@ -482,6 +515,7 @@ void PINEServer::ClientLoop()
 
 void PINEServer::Deinitialize()
 {
+	ControlBridge::Invalidate();
 	s_end.store(true, std::memory_order_release);
 
 #ifndef _WIN32
@@ -510,6 +544,26 @@ void PINEServer::Deinitialize()
 
 PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8>& ret_buffer, u32 buf_size)
 {
+	if (ControlBridge::Enabled())
+	{
+		// 0x10 was unused in this fork. Bridge frames contain exactly one command;
+		// legacy PINE operations (including unsynchronized reads/writes/loads) are
+		// unavailable throughout an explicitly enabled diagnostic instance.
+		if (!buf_size || buf[0] != 0x10)
+		{
+			ControlBridge::Disconnect(s_connection);
+			return IPCBuffer{5, MakeFailIPC(ret_buffer)};
+		}
+		const std::vector<u8> reply = ControlBridge::Transact(s_connection, buf.subspan(1, buf_size - 1));
+		const u32 length = static_cast<u32>(reply.size()) + 5;
+		const bool ok = reply.size() >= 4 && (reply[2] == 0 || reply[2] == 1) && reply[3] == 0;
+		if (ok)
+			MakeOkIPC(ret_buffer, length);
+		else
+			MakeFailIPC(ret_buffer, length);
+		std::memcpy(ret_buffer.data() + 5, reply.data(), reply.size());
+		return IPCBuffer{static_cast<int>(length), ret_buffer};
+	}
 	u32 ret_cnt = 5;
 	u32 buf_cnt = 0;
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "ControlBridge.h"
+
 #include "Host.h"
 #include "Input/InputManager.h"
 #include "SIO/Pad/Pad.h"
@@ -89,6 +91,7 @@ std::optional<u32> Pad::ControllerInfo::GetBindIndex(const std::string_view name
 
 void Pad::LoadConfig(const SettingsInterface& si)
 {
+	ControlBridge::Invalidate();
 	s_macro_buttons = {};
 
 	const bool mtapPort0Changed = EmuConfig.Pad.MultitapPort0_Enabled != Pad::mtapPort0LastState;
@@ -552,6 +555,8 @@ PadBase* Pad::GetPad(const u8 unifiedSlot)
 
 void Pad::SetControllerState(u32 controller, u32 bind, float value)
 {
+	if (controller == 0 && ControlBridge::OwnsPad())
+		return; // Host/macro/script P1 writes are suppressed by the explicit lease.
 	if (controller >= NUM_CONTROLLER_PORTS)
 		return;
 
@@ -560,6 +565,8 @@ void Pad::SetControllerState(u32 controller, u32 bind, float value)
 
 void Pad::ResetControllerInputs(u32 controller)
 {
+	if (controller == 0 && ControlBridge::OwnsPad())
+		return;
 	if (controller >= NUM_CONTROLLER_PORTS || !HasConnectedPad(controller))
 		return;
 
@@ -763,10 +770,9 @@ void Pad::SetMacroButtonState(InputBindingKey& key, u32 pad, u32 index, bool sta
 void Pad::ApplyMacroButton(u32 controller, const Pad::MacroButton& mb)
 {
 	const float value = mb.toggle_state ? mb.pressure : 0.0f;
-	PadBase* const pad = Pad::GetPad(controller);
 
 	for (const u32 btn : mb.buttons)
-		pad->Set(btn, value);
+		SetControllerState(controller, btn, value);
 }
 
 void Pad::UpdateMacroButtons()

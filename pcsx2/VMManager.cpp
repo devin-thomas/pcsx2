@@ -6,6 +6,7 @@
 #include "CDVD/CDVD.h"
 #include "CDVD/IsoReader.h"
 #include "Counters.h"
+#include "ControlBridge.h"
 #include "DEV9/DEV9.h"
 #include "DebugTools/DebugInterface.h"
 #include "DebugTools/SymbolImporter.h"
@@ -270,6 +271,8 @@ void VMManager::ResetResumeTimestamp()
 
 void VMManager::SetState(VMState state)
 {
+	if (!ControlBridge::AllowVMStateChange(state))
+		return;
 	// Some state transitions aren't valid.
 	const VMState old_state = s_state.load(std::memory_order_acquire);
 	pxAssert(state != VMState::Initializing && state != VMState::Shutdown);
@@ -1685,6 +1688,7 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 
 void VMManager::Shutdown(bool save_resume_state)
 {
+	ControlBridge::Invalidate();
 	GGScript::OnShutdown();
 
 	// we'll probably already be stopping (this is how Qt calls shutdown),
@@ -1801,6 +1805,12 @@ bool VMManager::RequestReset()
 
 void VMManager::Reset()
 {
+	ControlBridge::Invalidate();
+	if (ControlBridge::InExecution())
+	{
+		Console.Warning("Reset refused during diagnostic CPU execution; retry after it has stopped.");
+		return;
+	}
 	pxAssert(HasValidVM());
 
 	// If we're running, we're probably going to be executing this at event test time,
@@ -1933,6 +1943,12 @@ std::string VMManager::GetCurrentSaveStateFileName(s32 slot, bool backup)
 
 bool VMManager::DoLoadState(const char* filename, Error* error)
 {
+	ControlBridge::Invalidate();
+	if (ControlBridge::InExecution())
+	{
+		Error::SetString(error, "State load refused during diagnostic CPU execution; retry after it has stopped.");
+		return false;
+	}
 	if (GSDumpReplayer::IsReplayingDump())
 	{
 		Error::SetString(error, TRANSLATE_STR("VMManager", "Cannot load state while replaying a GS dump."));
@@ -2357,6 +2373,11 @@ void VMManager::Internal::FrameRateChanged()
 
 void VMManager::FrameAdvance(u32 num_frames /*= 1*/)
 {
+	if (ControlBridge::OwnsPad())
+	{
+		Console.Warning("Frame advance refused while the diagnostic control bridge owns P1.");
+		return;
+	}
 	if (!HasValidVM())
 		return;
 
@@ -2370,6 +2391,11 @@ void VMManager::FrameAdvance(u32 num_frames /*= 1*/)
 
 	s_frame_advance_count = num_frames;
 	SetState(VMState::Running);
+}
+
+bool VMManager::IsFrameAdvanceInProgress()
+{
+	return s_frame_advance_count != 0;
 }
 
 bool VMManager::ChangeDisc(CDVD_SourceType source, std::string path)
@@ -2800,16 +2826,20 @@ void VMManager::Execute()
 	}
 
 	// Execute until we're asked to stop.
+	ControlBridge::ExecutionStarted();
 	Cpu->Execute();
+	ControlBridge::ExecutionStopped();
 }
 
 void VMManager::IdlePollUpdate()
 {
+	const bool bridge_owned = ControlBridge::OwnsPad();
 	Achievements::IdleUpdate();
 
 	PollDiscordPresence();
 
 	InputManager::PollSources();
+	ControlBridge::FinishInputPoll(bridge_owned);
 }
 
 void VMManager::SetPaused(bool paused)
@@ -2971,8 +3001,11 @@ void VMManager::Internal::VSyncOnCPUThread()
 
 void VMManager::Internal::PollInputOnCPUThread()
 {
+	const bool bridge_owned = ControlBridge::OwnsPad();
 	Host::PumpMessagesOnCPUThread();
 	InputManager::PollSources();
+	if (ControlBridge::FinishInputPoll(bridge_owned))
+		return; // The explicit control lease arbitrates P1; scripts/recording were refused.
 	GGScript::OnPollInput();
 
 	if (EmuConfig.EnableRecordingTools)
