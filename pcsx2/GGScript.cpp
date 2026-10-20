@@ -36,6 +36,8 @@
 //   turbo on|off             run unthrottled (menus) or at normal speed
 //   log <text>
 //   quit                     shut the VM down (pcsx2-qt -batch then exits)
+//   stick <lx> <ly> <rx> <ry>  analog sticks, as the bytes the pad reports (decimal 0..255, up/left low, down/right high;
+//                            this build's rest value is 127). Held until the next stick line. ggmod addition.
 //
 // Input log (GG_INPUT_LOG=<file>): while no script is playing (none given, or after the given one has run out
 // without quitting), port 1's pad state is written to <file> every frame, run-length encoded, in the format above:
@@ -58,6 +60,7 @@ namespace GGScript
 		Log,
 		Turbo,
 		Quit,
+		Stick,
 	};
 
 	struct Step
@@ -78,6 +81,9 @@ namespace GGScript
 	static bool s_quit = false;
 	static u64 s_frame = 0;
 	static std::string s_script_path;
+	static u8 s_stick[4] = {127, 127, 127, 127}; // lx ly rx ry bytes (ggmod)
+	static u8 s_logged_stick[4] = {127, 127, 127, 127};
+	static bool s_log_all = false; // GG_INPUT_LOG_ALL: log from frame 1 even while a script plays
 
 	// Input log
 	static const char* s_log_path = nullptr;
@@ -200,6 +206,18 @@ namespace GGScript
 				s_steps.push_back({Kind::Log, 0, 0, rest, line_no});
 			else if (cmd == "quit")
 				s_steps.push_back({Kind::Quit, 0, 0, {}, line_no});
+			else if (cmd == "stick" && tok.size() == 5)
+			{
+				u32 v[4];
+				for (int k = 0; k < 4; k++)
+				{
+					const std::optional<u32> n = StringUtil::FromChars<u32>(tok[k + 1]);
+					if (!n.has_value() || n.value() > 255)
+						return bad();
+					v[k] = n.value();
+				}
+				s_steps.push_back({Kind::Stick, 0, v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24), {}, line_no});
+			}
 			else if (const std::optional<u32> frames = StringUtil::FromChars<u32>(cmd); frames.has_value() && tok.size() == 2)
 			{
 				u32 mask = 0;
@@ -236,13 +254,36 @@ namespace GGScript
 		return true;
 	}
 
-	// Applied every frame, so a controller touched during a script can't leave a button held. Sticks stay centred.
+	// One stick axis: byte b is what PadDualshock2::Set reports for the value we hand it (its MERGE macro): above 127 the
+	// "positive" input r gives 127 + (r + 1) / 2, below 127 the "negative" input r gives 127 - r / 2. The scale is 1.0 in
+	// our pad settings (AxisScale = 1.00), so value * 255 is the raw byte.
+	static void SetAxis(u32 pos, u32 neg, u8 b)
+	{
+		u32 rp = 0, rn = 0;
+		if (b > 127)
+			rp = 2 * (b - 127u) - 1;
+		else if (b < 127)
+			rn = 2 * (127u - b);
+		Pad::SetControllerState(0, pos, rp ? (rp + 0.5f) / 255.0f : 0.0f);
+		Pad::SetControllerState(0, neg, rn ? (rn + 0.5f) / 255.0f : 0.0f);
+	}
+
+	static void ApplySticks()
+	{
+		using I = PadDualshock2;
+		SetAxis(I::PAD_L_RIGHT, I::PAD_L_LEFT, s_stick[0]);
+		SetAxis(I::PAD_L_DOWN, I::PAD_L_UP, s_stick[1]);
+		SetAxis(I::PAD_R_RIGHT, I::PAD_R_LEFT, s_stick[2]);
+		SetAxis(I::PAD_R_DOWN, I::PAD_R_UP, s_stick[3]);
+	}
+
+	// Applied every frame, so a controller touched during a script can't leave a button held. Sticks follow the last
+	// `stick` line (centred until there is one).
 	static void ApplyButtons(u32 mask)
 	{
 		for (u32 i = 0; i <= PadDualshock2::PAD_R3; i++)
 			Pad::SetControllerState(0, i, (mask & (1u << i)) ? 1.0f : 0.0f);
-		for (u32 i = PadDualshock2::PAD_L_UP; i <= PadDualshock2::PAD_R_LEFT; i++)
-			Pad::SetControllerState(0, i, 0.0f);
+		ApplySticks();
 	}
 
 	// ------------------------------------------------------------------ input log
@@ -380,6 +421,27 @@ namespace GGScript
 			mask |= stick;
 		}
 
+		u8 sb[4] = {127, 127, 127, 127};
+		if (pad && pad->GetType() == Pad::ControllerType::DualShock2)
+		{
+			using I = PadDualshock2;
+			// PadDualshock2::Set's MERGE, for the non-inverted sticks
+			auto axis = [&](u32 pos, u32 neg) -> u8 {
+				const u8 rp = pad->GetRawInput(pos), rn = pad->GetRawInput(neg);
+				return rp ? static_cast<u8>(127u + (rp + 1u) / 2u) : static_cast<u8>(127u - rn / 2u);
+			};
+			sb[0] = axis(I::PAD_L_RIGHT, I::PAD_L_LEFT);
+			sb[1] = axis(I::PAD_L_DOWN, I::PAD_L_UP);
+			sb[2] = axis(I::PAD_R_RIGHT, I::PAD_R_LEFT);
+			sb[3] = axis(I::PAD_R_DOWN, I::PAD_R_UP);
+		}
+		if (std::memcmp(sb, s_logged_stick, 4) != 0)
+		{
+			FlushRun();
+			LogLine(fmt::format("stick {} {} {} {}", sb[0], sb[1], sb[2], sb[3]), s_log_frame + 1);
+			std::memcpy(s_logged_stick, sb, 4);
+		}
+
 		s_log_frame++;
 		const bool rec = GSIsLayerRecording();
 		if (rec != s_log_rec)
@@ -482,6 +544,11 @@ namespace GGScript
 					Console.WriteLn("gg-script: frame %llu: %s", s_frame, step.arg.c_str());
 					break;
 
+				case Kind::Stick:
+					for (int k = 0; k < 4; k++)
+						s_stick[k] = static_cast<u8>(step.buttons >> (8 * k));
+					break;
+
 				case Kind::Quit:
 					ApplyButtons(0);
 					s_done = true;
@@ -507,12 +574,13 @@ void GGScript::OnPollInput()
 			s_script_path = path;
 		const char* log = std::getenv("GG_INPUT_LOG");
 		s_log_path = (log && *log) ? log : nullptr;
+		s_log_all = std::getenv("GG_INPUT_LOG_ALL") != nullptr;
 	}
 
 	s_frame++;
 	if (!s_done)
 		PlayFrame();
-	if (s_done && !s_quit && s_log_path)
+	if ((s_done || s_log_all) && !s_quit && s_log_path)
 		LogFrame();
 }
 
