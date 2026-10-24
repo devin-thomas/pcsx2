@@ -211,6 +211,10 @@
     CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
+// gg-layers: multi-key lookups use lower_bound, not find. std::multimap::find may return
+// any equal key (libc++ 22 stops at the first one met while descending), and every walk
+// below assumes the first. With find, the first entries of a multi-value key such as
+// [Cheats] Enable were skipped.
 #ifndef INCLUDED_SimpleIni_h
 #define INCLUDED_SimpleIni_h
 
@@ -2089,7 +2093,8 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::AddEntry(
 
     // check for existence of the key
     TKeyVal & keyval = iSection->second;
-    typename TKeyVal::iterator iKey = keyval.find(a_pKey);
+    typename TKeyVal::iterator iKey = keyval.lower_bound(a_pKey);
+    if (iKey != keyval.end() && IsLess(a_pKey, iKey->first.pItem)) iKey = keyval.end();
     bInserted = iKey == keyval.end();
 
     // remove all existing entries but save the load order and
@@ -2168,7 +2173,8 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::GetValue(
     if (iSection == m_data.end()) {
         return a_pDefault;
     }
-    typename TKeyVal::const_iterator iKeyVal = iSection->second.find(a_pKey);
+    typename TKeyVal::const_iterator iKeyVal = iSection->second.lower_bound(a_pKey);
+    if (iKeyVal != iSection->second.end() && IsLess(a_pKey, iKeyVal->first.pItem)) iKeyVal = iSection->second.end();
     if (iKeyVal == iSection->second.end()) {
         return a_pDefault;
     }
@@ -2398,7 +2404,8 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::GetAllValues(
     if (iSection == m_data.end()) {
         return false;
     }
-    typename TKeyVal::const_iterator iKeyVal = iSection->second.find(a_pKey);
+    typename TKeyVal::const_iterator iKeyVal = iSection->second.lower_bound(a_pKey);
+    if (iKeyVal != iSection->second.end() && IsLess(a_pKey, iKeyVal->first.pItem)) iKeyVal = iSection->second.end();
     if (iKeyVal == iSection->second.end()) {
         return false;
     }
@@ -2787,7 +2794,8 @@ CSimpleIniTempl<SI_CHAR,SI_STRLESS,SI_CONVERTER>::DeleteValue(
 
     // remove a single key if we have a keyname
     if (a_pKey) {
-        typename TKeyVal::iterator iKeyVal = iSection->second.find(a_pKey);
+        typename TKeyVal::iterator iKeyVal = iSection->second.lower_bound(a_pKey);
+        if (iKeyVal != iSection->second.end() && IsLess(a_pKey, iKeyVal->first.pItem)) iKeyVal = iSection->second.end();
         if (iKeyVal == iSection->second.end()) {
             return false;
         }
