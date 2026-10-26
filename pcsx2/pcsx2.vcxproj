@@ -438,6 +438,7 @@
     <ClCompile Include="GS\GSDump.cpp" />
     <ClCompile Include="GS\GSLayerFilter.cpp" />
     <ClCompile Include="GGScript.cpp" />
+    <ClCompile Include="GGTrace.cpp" />
     <ClCompile Include="GS\Renderers\Common\GSFunctionMap.cpp" />
     <ClCompile Include="GS\Renderers\HW\GSHwHack.cpp" />
     <ClCompile Include="GS\GSLocalMemory.cpp" />
@@ -882,6 +883,7 @@
     <ClInclude Include="GS\GSDump.h" />
     <ClInclude Include="GS\GSLayerFilter.h" />
     <ClInclude Include="GGScript.h" />
+    <ClInclude Include="GGTrace.h" />
     <ClInclude Include="GS\Renderers\Common\GSFastList.h" />
     <ClInclude Include="GS\Renderers\Common\GSFunctionMap.h" />
     <ClInclude Include="GS\GSLocalMemory.h" />

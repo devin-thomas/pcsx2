@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "GGTrace.h"
 #include "CDVD/CDVD.h"
 #include "DebugTools/Breakpoints.h"
 #include "Elfheader.h"
@@ -1701,6 +1702,13 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 
 		_clearNeededX86regs();
 		_clearNeededXMMregs();
+	}
+
+	// gg-trace: the Lockstep Trace recorder's hooks see the registers as the interpreter would
+	if (!delayslot && GGTrace::IsHook(pc))
+	{
+		iFlushCall(FLUSH_EVERYTHING | FLUSH_PC);
+		xFastCall((void*)GGTrace::OnHook);
 	}
 
 	s_pCode = (int*)PSM(pc);

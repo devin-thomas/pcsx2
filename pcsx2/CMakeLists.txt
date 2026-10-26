@@ -137,6 +137,7 @@ set(pcsx2Sources
 	Vif_Unpack.cpp
 	VMManager.cpp
 	GGScript.cpp
+	GGTrace.cpp
 	vtlb.cpp
 	VU0.cpp
 	VUmicro.cpp

@@ -26,8 +26,9 @@
 // Script format, one step per line ('#' starts a comment):
 //   map D=R1 P=Square        letters P K S H D -> PS2 buttons (defaults P=Square K=Cross S=Triangle H=Circle D=R1)
 //   face right|left          numpad directions are relative to the facing (6 = forward)
-//   <frames> <input>         hold an input: numpad digit and/or letters, or PS2 names joined with '+',
-//                            e.g. "1 9", "3 2D", "10 5", "1 Start", "2 Down+Cross"
+//   <frames> <input> [<input2>]  hold an input: numpad digit and/or letters, or PS2 names joined with '+',
+//                            e.g. "1 9", "3 2D", "10 5", "1 Start", "2 Down+Cross"; a second input is pad 2's
+//                            (gg-trace), with its own facing ("face2 left")
 //   wait <frames>            neutral
 //   rec start [name]         start a GS dump + reference video into $GG_CAPTURE_ROOT/<name>
 //   rec stop
@@ -40,7 +41,8 @@
 //                            this build's rest value is 127). Held until the next stick line. ggmod addition.
 //
 // Input log (GG_INPUT_LOG=<file>): while no script is playing (none given, or after the given one has run out
-// without quitting), port 1's pad state is written to <file> every frame, run-length encoded, in the format above:
+// without quitting), port 1's pad state (and port 2's buttons, as the second input) is written to <file> every
+// frame, run-length encoded, in the format above:
 // numpad directions with "face right" (6 = Right), P K S H D for Square Cross Triangle Circle R1, PS2 names joined
 // with '+' when other buttons are held. These are the button bits the game reads; the left stick is folded into
 // the directions past half-way (the replay then has no analog stick, so a take played on the stick may not replay
@@ -70,6 +72,7 @@ namespace GGScript
 		u32 buttons; // bitmask of PadDualshock2::Inputs
 		std::string arg;
 		u32 line;
+		u32 buttons2 = 0; // pad 2 (gg-trace)
 	};
 
 	static bool s_loaded = false;
@@ -78,6 +81,7 @@ namespace GGScript
 	static size_t s_pos = 0;
 	static u32 s_left = 0;
 	static u32 s_mask = 0;
+	static u32 s_mask2 = 0;
 	static bool s_quit = false;
 	static u64 s_frame = 0;
 	static std::string s_script_path;
@@ -91,6 +95,7 @@ namespace GGScript
 	static u64 s_log_frame = 0; // frames logged
 	static u64 s_log_first = 0; // run frame of the first logged frame
 	static u32 s_run_mask = 0;
+	static u32 s_run_mask2 = 0;
 	static u32 s_run_len = 0;
 	static u64 s_run_start = 0;
 	static bool s_log_rec = false; // layer recording on at the previous logged frame
@@ -138,9 +143,9 @@ namespace GGScript
 		u32 letters[5] = {Bit(PadDualshock2::PAD_SQUARE), Bit(PadDualshock2::PAD_CROSS), Bit(PadDualshock2::PAD_TRIANGLE),
 			Bit(PadDualshock2::PAD_CIRCLE), Bit(PadDualshock2::PAD_R1)};
 		static constexpr std::string_view letter_names = "PKSHD";
-		bool face_right = true;
+		bool face_right = true, face2_right = true;
 
-		auto numpad = [&face_right](char c) -> u32 {
+		auto numpad = [](char c, bool face_right) -> u32 {
 			const u32 fwd = Bit(face_right ? PadDualshock2::PAD_RIGHT : PadDualshock2::PAD_LEFT);
 			const u32 back = Bit(face_right ? PadDualshock2::PAD_LEFT : PadDualshock2::PAD_RIGHT);
 			const u32 up = Bit(PadDualshock2::PAD_UP), down = Bit(PadDualshock2::PAD_DOWN);
@@ -190,6 +195,8 @@ namespace GGScript
 			}
 			else if (cmd == "face" && tok.size() == 2)
 				face_right = (tok[1] != "left");
+			else if (cmd == "face2" && tok.size() == 2)
+				face2_right = (tok[1] != "left");
 			else if (cmd == "wait" && tok.size() == 2 && StringUtil::FromChars<u32>(tok[1]).has_value())
 				s_steps.push_back({Kind::Hold, StringUtil::FromChars<u32>(tok[1]).value(), 0, {}, line_no});
 			else if (cmd == "rec" && tok.size() >= 2 && tok[1] == "start")
@@ -218,33 +225,41 @@ namespace GGScript
 				}
 				s_steps.push_back({Kind::Stick, 0, v[0] | (v[1] << 8) | (v[2] << 16) | (v[3] << 24), {}, line_no});
 			}
-			else if (const std::optional<u32> frames = StringUtil::FromChars<u32>(cmd); frames.has_value() && tok.size() == 2)
+			else if (const std::optional<u32> frames = StringUtil::FromChars<u32>(cmd);
+					 frames.has_value() && (tok.size() == 2 || tok.size() == 3))
 			{
-				u32 mask = 0;
-				const std::string_view input = tok[1];
-				if (input.find('+') != std::string_view::npos || (input.size() > 1 && ButtonByName(input).has_value()))
-				{
-					for (const std::string_view name : StringUtil::SplitString(input, '+'))
+				// one input: a numpad digit and letters, or PS2 names joined with '+'
+				auto parse = [&](std::string_view input, bool right) -> std::optional<u32> {
+					u32 mask = 0;
+					if (input.find('+') != std::string_view::npos || (input.size() > 1 && ButtonByName(input).has_value()))
 					{
-						const std::optional<u32> b = ButtonByName(name);
-						if (!b.has_value())
-							return bad();
-						mask |= b.value();
+						for (const std::string_view name : StringUtil::SplitString(input, '+'))
+						{
+							const std::optional<u32> b = ButtonByName(name);
+							if (!b.has_value())
+								return std::nullopt;
+							mask |= b.value();
+						}
+						return mask;
 					}
-				}
-				else
-				{
 					for (const char c : input)
 					{
 						if (c >= '1' && c <= '9')
-							mask |= numpad(c);
+							mask |= numpad(c, right);
 						else if (const size_t li = letter_names.find(c); li != std::string_view::npos)
 							mask |= letters[li];
 						else
-							return bad();
+							return std::nullopt;
 					}
-				}
-				s_steps.push_back({Kind::Hold, frames.value(), mask, {}, line_no});
+					return mask;
+				};
+				const std::optional<u32> m1 = parse(tok[1], face_right);
+				const std::optional<u32> m2 = tok.size() == 3 ? parse(tok[2], face2_right) : std::optional<u32>(0);
+				if (!m1.has_value() || !m2.has_value())
+					return bad();
+				Step st{Kind::Hold, frames.value(), m1.value(), {}, line_no};
+				st.buttons2 = m2.value();
+				s_steps.push_back(st);
 			}
 			else
 				return bad();
@@ -279,10 +294,13 @@ namespace GGScript
 
 	// Applied every frame, so a controller touched during a script can't leave a button held. Sticks follow the last
 	// `stick` line (centred until there is one).
-	static void ApplyButtons(u32 mask)
+	static void ApplyButtons(u32 mask, u32 mask2 = 0)
 	{
 		for (u32 i = 0; i <= PadDualshock2::PAD_R3; i++)
+		{
 			Pad::SetControllerState(0, i, (mask & (1u << i)) ? 1.0f : 0.0f);
+			Pad::SetControllerState(1, i, (mask2 & (1u << i)) ? 1.0f : 0.0f);
+		}
 		ApplySticks();
 	}
 
@@ -347,8 +365,12 @@ namespace GGScript
 	{
 		if (s_run_len == 0)
 			return;
-		LogLine(s_run_mask == 0 ? fmt::format("wait {}", s_run_len) : fmt::format("{} {}", s_run_len, Describe(s_run_mask)),
-			s_run_start);
+		if (s_run_mask2 != 0)
+			LogLine(fmt::format("{} {} {}", s_run_len, s_run_mask ? Describe(s_run_mask) : std::string("5"), Describe(s_run_mask2)),
+				s_run_start);
+		else
+			LogLine(s_run_mask == 0 ? fmt::format("wait {}", s_run_len) : fmt::format("{} {}", s_run_len, Describe(s_run_mask)),
+				s_run_start);
 		s_run_len = 0;
 	}
 
@@ -380,7 +402,7 @@ namespace GGScript
 		if (!s_script_path.empty())
 			std::fprintf(s_log, "# Logging started when script %s ran out, on frame %llu of the run.\n", s_script_path.c_str(),
 				static_cast<unsigned long long>(s_frame));
-		std::fprintf(s_log, "map D=R1\nface right\n");
+		std::fprintf(s_log, "map D=R1\nface right\nface2 right\n");
 		std::fflush(s_log);
 		s_log_first = s_frame;
 		s_log_rec = GSIsLayerRecording();
@@ -421,6 +443,17 @@ namespace GGScript
 			mask |= stick;
 		}
 
+		u32 mask2 = 0; // pad 2's buttons (gg-trace); its sticks are not logged
+		if (PadBase* pad2 = Pad::GetPad(1, 0); pad2 && pad2->GetType() == Pad::ControllerType::DualShock2)
+		{
+			const u32 buttons = pad2->GetButtons();
+			for (u32 i = 0; i <= PadDualshock2::PAD_R3; i++)
+			{
+				if (!(buttons & (1u << s_button_bit[i])))
+					mask2 |= 1u << i;
+			}
+		}
+
 		u8 sb[4] = {127, 127, 127, 127};
 		if (pad && pad->GetType() == Pad::ControllerType::DualShock2)
 		{
@@ -456,13 +489,14 @@ namespace GGScript
 			Console.WriteLn("gg-log: frame %llu rec %s", static_cast<unsigned long long>(s_log_frame), rec ? "start" : "stop");
 			s_log_rec = rec;
 		}
-		if (s_run_len > 0 && mask == s_run_mask)
+		if (s_run_len > 0 && mask == s_run_mask && mask2 == s_run_mask2)
 		{
 			s_run_len++;
 			return;
 		}
 		FlushRun();
 		s_run_mask = mask;
+		s_run_mask2 = mask2;
 		s_run_len = 1;
 		s_run_start = s_log_frame;
 	}
@@ -490,7 +524,7 @@ namespace GGScript
 		{
 			if (s_pos >= s_steps.size())
 			{
-				s_mask = 0;
+				s_mask = s_mask2 = 0;
 				ApplyButtons(0);
 				s_done = true;
 				Console.WriteLn("gg-script: finished at frame %llu", s_frame);
@@ -503,6 +537,7 @@ namespace GGScript
 				case Kind::Hold:
 					s_left = step.frames;
 					s_mask = step.buttons;
+					s_mask2 = step.buttons2;
 					break;
 
 				case Kind::RecStart:
@@ -558,7 +593,7 @@ namespace GGScript
 					return;
 			}
 		}
-		ApplyButtons(s_mask);
+		ApplyButtons(s_mask, s_mask2);
 		s_left--;
 	}
 } // namespace GGScript
